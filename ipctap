@@ -1,0 +1,1083 @@
+#!/usr/bin/env python3
+"""ipctap traces CoreIPC messages between the processes of Safari, or another app that uses WebKit,
+and the other Mach messages they send, with DTrace.
+
+  sudo ./ipctap trace [-a APP] [-p PROCESS] [-m MESSAGE] [-o FILE] [-t SECONDS] [--bytes [N]]
+                      trace Safari or APP until Ctrl-C, or for SECONDS
+  ./ipctap show FILE [-p PROCESS] [-m MESSAGE]
+                      print a trace saved as ndjson
+  ./ipctap setup      read this Mac's WebKit and write its D scripts (trace does this when needed)
+"""
+import argparse
+import collections
+import contextlib
+import ctypes
+import fnmatch
+import heapq
+import itertools
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+VERSION = "1.0.0"
+WEBKIT = "/System/Library/Frameworks/WebKit.framework/Versions/A/WebKit"
+LIBDISPATCH = "/usr/lib/system/libdispatch.dylib"
+BUILDS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "builds")
+PROCESSES = ["UI", "Networking", "GPU", "WebContent", "Model", "?"]  # WebKit's ProcessName order
+PAIRING = 100_000_000  # ns. A receive almost always lands within 1 ms of its send.
+HOLD = 3_000_000_000  # ns. How long a Mach message waits for an lsmp snapshot that has its port.
+# XPC's msgh_ids: a message, a reply, a notification, a message that waits for its reply, and the
+# two check-ins a new connection starts with.
+XPC_IDS = {0x10000000, 0x20000000, 0x30000000, 0x40000000, 0x77303074, 0x77494e74}
+ISSUES = "https://github.com/almamatertech/ipctap/issues"
+
+# The functions setup reads, by the start of their mangled names.
+FUNCTIONS = {
+    "encoder": "__ZN3WTF35makeUniqueRefWithoutFastMallocCheckIN3IPC7EncoderEJNS1_11MessageNameEyEEE",
+    "send": "__ZN3IPC10Connection15sendMessageImplE",
+    "send_outgoing": "__ZN3IPC10Connection19sendOutgoingMessageE",
+    "receive": "__ZN3IPC10Connection22processIncomingMessageEN3WTF9UniqueRefINS_7DecoderEEE",
+    "decoder": "__ZN3IPC7Decoder6createENSt3__14spanIKhLm18446744073709551615EEEON3WTF8Function",
+    "decode_name": "__ZN3IPC7Decoder6decodeINS_11MessageNameEEE",
+}
+
+
+def uuids():
+    """The UUIDs of WebKit and libdispatch, whose fields the D scripts read."""
+    out = subprocess.run(["dyld_info", "-uuid", WEBKIT, LIBDISPATCH], capture_output=True, text=True,
+                         check=True).stdout
+    return re.findall(r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}", out)
+
+
+# Setup
+
+
+def stream_receiver(symbol):
+    """The class in WebKit::<class>::didReceiveStreamMessage(IPC::StreamServerConnection&, IPC::Decoder&)."""
+    m = re.match(r"__ZN6WebKit(\d+)", symbol)
+    if m:
+        end = m.end() + int(m[1])
+        rest = symbol[end:]
+        if rest.startswith("23didReceiveStreamMessageERN3IPC22StreamServerConnectionERN") and rest.endswith("_7DecoderE"):
+            return symbol[m.end():end]
+    return None
+
+
+def webkit_function(symbol):
+    """The FUNCTIONS key of a WebKit symbol, or the class of a stream receiver."""
+    for key, prefix in FUNCTIONS.items():
+        if symbol.startswith(prefix):
+            return key
+    return stream_receiver(symbol)
+
+
+def disassemble(path, wanted):
+    """Disassemble path, keeping each function that wanted(symbol) gives a key. Returns, by key,
+    the function's instructions as (mnemonic, operands, comment), and their addresses."""
+    code, addresses = {}, {}
+    current = None
+    dis = subprocess.Popen(["dyld_info", "-disassemble", path], stdout=subprocess.PIPE, text=True, errors="replace")
+    for line in dis.stdout:
+        if line.startswith("0x"):
+            if current is not None:
+                text, _, comment = line.partition(";")
+                parts = text.split(None, 2)
+                current.append((parts[1], parts[2].strip() if len(parts) > 2 else "", comment.strip()))
+                addresses[key].append(int(parts[0], 16))
+            continue
+        key = wanted(line.rstrip().rstrip(":"))
+        current = None
+        if key in code:
+            sys.exit(f"setup: two functions in {path} match {key}")
+        if key:
+            current = code[key] = []
+            addresses[key] = []
+    if dis.wait():
+        sys.exit(f"setup: dyld_info -disassemble {path} failed")
+    return code, addresses
+
+
+def arguments(code):
+    """Registers that copy x0 or x1 before the function's first call."""
+    copies = {}
+    for op, args, _ in code:
+        if op == "bl":
+            break
+        m = re.fullmatch(r"(x\d+), (x[01])", args)
+        if op == "mov" and m:
+            copies[m[1]] = m[2]
+    return copies
+
+
+def encoder_offsets(code):
+    """Name and destination offsets from the Encoder constructor. It loads the name
+    through its first argument and the destination through its second, and stores
+    both into the new Encoder, which the allocation call returns in x0."""
+    copies = arguments(code)
+    name_reg = dest_reg = name = dest = None
+    for op, args, _ in code:
+        m = re.fullmatch(r"(\w+), \[(x\d+)\]", args)
+        if op == "ldrh" and m and copies.get(m[2]) == "x0":
+            name_reg = m[1]
+        if op == "ldr" and m and copies.get(m[2]) == "x1":
+            dest_reg = m[1]
+        m = re.fullmatch(r"(\w+), \[x0(?:, #(\w+))?\]", args)
+        if op == "strh" and m and m[1] == name_reg and name is None:
+            name = int(m[2] or "0", 0)
+        if op == "str" and m and m[1] == dest_reg and dest is None:
+            dest = int(m[2] or "0", 0)
+    return name, dest
+
+
+def encoder_size_offset(code):
+    """The Encoder's size field, which sendOutgoingMessage compares with the
+    512-byte inline buffer."""
+    found = set()
+    for (op0, args0, _), (op, args, _), (op2, args2, _) in zip(code, code[1:], code[2:]):
+        limit = re.fullmatch(r"w(\d+), #0x200", args0)
+        m = re.fullmatch(r"x(\d+), \[x\d+, #(\w+)\]", args)
+        if op0 == "mov" and limit and op == "ldr" and m and op2 == "cmp" and args2 == f"x{m[1]}, x{limit[1]}":
+            found.add(int(m[2], 0))
+    return found.pop() if len(found) == 1 else None
+
+
+def encoder_buffer_offsets(code):
+    """Where sendOutgoingMessage finds the Encoder's bytes, as the offsets of its out-of-line
+    buffer pointer and of the inline buffer it uses when that pointer is null."""
+    for (op0, args0, _), (op1, args1, _), (op2, args2, _) in zip(code, code[1:], code[2:]):
+        m = re.fullmatch(r"(x\d+), \[(x\d+), #(\w+)\]", args0)
+        if op0 == "ldr" and m and op1 == "cbnz" and args1.startswith(m[1] + ","):
+            inline = re.fullmatch(rf"{m[1]}, {m[2]}, #(\w+)", args2)
+            if op2 == "add" and inline:
+                return int(m[3], 0), int(inline[1], 0)
+    return None, None
+
+
+def name_offset(code):
+    """The offset of the first 16-bit load, which reads the message name."""
+    for op, args, _ in code:
+        m = re.fullmatch(r"w\d+, \[x\d+(?:, #(\w+))?\]", args)
+        if op == "ldrh" and m:
+            return int(m[1] or "0", 0)
+    return None
+
+
+def decoder_offsets(code):
+    """Buffer, size, read position, name and destination offsets from Decoder::create.
+    It stores its buffer (x0) and size (x1) at the start of the new Decoder and the
+    buffer again as the read position, then the result of decode<MessageName> as the
+    name, then the destination once it isn't -1."""
+    copies = arguments(code)
+    buffer = size = position = name = dest = buffer_reg = base = None
+    decoded_name = False
+    for i, (op, args, _) in enumerate(code):
+        m = re.fullmatch(r"(x\d+), (x\d+), \[(x\d+)(?:, #(\w+))?\]", args)
+        if op == "stp" and m and copies.get(m[1]) == "x0" and copies.get(m[2]) == "x1" and size is None:
+            buffer_reg, base, buffer = m[1], m[3], int(m[4] or "0", 0)
+            size = buffer + 8
+        m = re.fullmatch(r"(x\d+), \[(x\d+), #(\w+)\]", args)
+        if op == "str" and m and buffer_reg and (m[1], m[2]) == (buffer_reg, base) and position is None:
+            position = int(m[3], 0)
+        if op == "bl" and "decodeINS_11MessageName" in args:
+            decoded_name = True
+        m = re.fullmatch(r"w0, \[x\d+, #(\w+)\]", args)
+        if op == "strh" and m and decoded_name and name is None:
+            name = int(m[1], 0)
+        m = re.fullmatch(r"(x\d+), #0x1", args)
+        if op == "cmn" and m and dest is None:
+            for op2, args2, _ in code[i + 1:i + 4]:
+                stored = re.fullmatch(rf"{m[1]}, \[x\d+, #(\w+)\]", args2)
+                if op2 == "str" and stored:
+                    dest = int(stored[1], 0)
+                    break
+    return buffer, size, position, name, dest
+
+
+def position_stores(code):
+    """The offsets decode<MessageName> stores to in its Decoder (x0), where it moves the read position."""
+    return {int(m[1], 0) for op, args, _ in code for m in [re.fullmatch(r"x\d+, \[x0, #(\w+)\]", args)]
+            if op == "str" and m}
+
+
+def reply_check(code):
+    """The Decoder name offset processIncomingMessage reads before comparing the name
+    with two reply IDs, and those IDs."""
+    for i, (op, args, _) in enumerate(code):
+        m = re.fullmatch(r"w\d+, \[x\d+, #(\w+)\]", args)
+        if op == "ldrh" and m:
+            ids = [int(c, 0) for op2, args2, _ in code[i + 1:i + 5] if op2 == "mov" for c in re.findall(r"#(\w+)$", args2)]
+            if len(ids) >= 2:
+                return int(m[1], 0), set(ids[:2])
+    return None, None
+
+
+def message_table(code):
+    """The address of messageDescriptions in processIncomingMessage, and the largest
+    message ID it looks up there."""
+    table = last = None
+    pages = {}
+    for i, (op, args, comment) in enumerate(code):
+        m = re.fullmatch(r"(x\d+), \d+", args)
+        if op == "adrp" and m and re.fullmatch(r"0x[0-9a-f]+", comment):
+            pages[m[1]] = int(comment, 16)
+        m = re.fullmatch(r"x\d+, (x\d+), #(\w+)", args)
+        if op == "add" and m and comment == "__ZN3IPC6Detail19messageDescriptionsE" and m[1] in pages:
+            table = pages[m[1]] + int(m[2], 0)
+        # The last ID is a constant the next instructions clamp the ID to, with umin (FEAT_CSSC)
+        # in the M6's arm64e.x1 code, and with a cmp and a csel in the arm64e code other Macs run.
+        m = re.fullmatch(r"(w\d+), #(\w+)", args)
+        if op == "mov" and m and last is None and i + 2 < len(code):
+            (op1, args1, _), (op2, args2, _) = code[i + 1:i + 3]
+            args1, args2 = args1.split(", "), args2.split(", ")
+            umin = op1 == "umin" and m[1] in args1
+            csel = (op1, op2) == ("cmp", "csel") and m[1] in args1 and m[1] in args2 and args2[-1] == "lo"
+            if umin or csel:
+                last = int(m[2], 0)
+    return table, last
+
+
+def read_names(table):
+    """IPC::Detail::messageDescriptions, read from WebKit loaded into this process.
+    Each 24-byte entry starts with the name and its length, and its bytes 18 and
+    19 are the sending and receiving process."""
+    ctypes.CDLL(WEBKIT)
+    dyld = ctypes.CDLL(None)
+    dyld._dyld_get_image_name.restype = ctypes.c_char_p
+    dyld._dyld_get_image_vmaddr_slide.restype = ctypes.c_long
+    slide = next(dyld._dyld_get_image_vmaddr_slide(i) for i in range(dyld._dyld_image_count())
+                 if dyld._dyld_get_image_name(i).endswith(b"/WebKit.framework/Versions/A/WebKit"))
+    names = []
+    while len(names) < 65536:
+        entry = table + slide + 24 * len(names)
+        text = ctypes.c_uint64.from_address(entry).value
+        length = ctypes.c_uint64.from_address(entry + 8).value
+        if not text or not 1 < length < 512:
+            break
+        name = ctypes.string_at(text, length)
+        if name[-1] != 0 or not name[:-1].isascii():
+            break
+        sender, receiver = ctypes.string_at(entry + 18, 2)
+        unknown = len(PROCESSES) - 1
+        names.append((name[:-1].decode(), PROCESSES[min(sender, unknown)], PROCESSES[min(receiver, unknown)]))
+        if names[-1][0] == "<invalid message name>":
+            return names
+    sys.exit(f"setup: entry {len(names)} of the message table doesn't look like a name")
+
+
+def own_process(names):
+    """Whether each message to these receivers goes to the process the receiver lives in."""
+    homes = {"WebPage": "WebContent", "WebPageProxy": "UI", "NetworkConnectionToWebProcess": "Networking",
+             "GPUConnectionToWebProcess": "GPU"}
+    return all(receiver == homes[name.split("_")[0]] for name, _, receiver in names
+               if name.split("_")[0] in homes and not name.endswith("Reply"))
+
+
+def label_offset(code):
+    """Where dispatch_queue_get_label reads a queue's label, which for the channel
+    of an XPC connection is the service name."""
+    for op, args, _ in code:
+        m = re.fullmatch(r"x\d+, \[x0, #(\w+)\]", args)
+        if op == "ldr" and m:
+            return int(m[1], 0)
+    return None
+
+
+def only_returns(code, addresses):
+    """Whether a function leaves only through ret, never by a branch out of it, so
+    that a DTrace return probe sees it leave."""
+    inside = set(addresses)
+    for op, args, _ in code:
+        target = args.split(", ")[-1]
+        branch = op == "b" or op.startswith("b.") or op in ("cbz", "cbnz", "tbz", "tbnz")
+        if re.fullmatch(r"br(a[ab]z?)?", op) or branch and not (re.fullmatch(r"0x[0-9a-f]+", target)
+                                                               and int(target, 16) in inside):
+            return False
+    return any(op.startswith("ret") for op, _, _ in code)
+
+
+def channel_checks(label):
+    """Make a dispatch channel like the ones XPC connections use, never connected, so
+    it sends nothing, and compare its label field with dispatch_queue_get_label."""
+    lib = ctypes.CDLL(None)
+    handler = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_int)(lambda *_: None)
+    lib.dispatch_mach_create_f.restype = ctypes.c_void_p
+    lib.dispatch_mach_create_f.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p, type(handler)]
+    lib.dispatch_queue_get_label.restype = ctypes.c_char_p
+    lib.dispatch_queue_get_label.argtypes = [ctypes.c_void_p]
+    lib.malloc_size.restype = ctypes.c_size_t
+    lib.malloc_size.argtypes = [ctypes.c_void_p]
+    channel = lib.dispatch_mach_create_f(b"com.apple.ipctap.setup", None, None, handler)
+    return {
+        "a dispatch channel's label field holds the label dispatch_queue_get_label gives":
+            ctypes.string_at(ctypes.c_uint64.from_address(channel + label).value) == b"com.apple.ipctap.setup"
+            == lib.dispatch_queue_get_label(channel),
+        "the label field is inside the channel": lib.malloc_size(channel) >= label + 8,
+    }
+
+
+D_SCRIPT = """\
+/*
+ * Traces CoreIPC messages in one process of an app that uses WebKit, and the other Mach
+ * messages it sends, for WebKit {uuid}.
+ * Written by ipctap setup. Run it with dtrace -s {file} -p <pid>{args}.
+ *
+ * One line per CoreIPC message with its kind, wall time in ns, thread, message ID,
+ * destination ID and size in bytes. ipctap turns the IDs into names.
+ */
+#pragma D option quiet
+#pragma D option bufsize={bufsize}
+#pragma D option switchrate=20hz
+
+/* The probes are live from here on. */
+BEGIN
+{{
+	printf("ready %d\\n", walltimestamp);
+}}
+
+{send}
+
+{receive}
+
+/* libdispatch sends the messages of XPC connections, and of its other Mach channels,
+   here. arg0 is the channel, whose label is the service name, and it makes the trap
+   below on this thread before it returns, which it does only through ret. */
+pid$target:libdispatch.dylib:_dispatch_mach_msg_send:entry
+{{
+	self->channel = arg0;
+}}
+
+pid$target:libdispatch.dylib:_dispatch_mach_msg_send:return
+{{
+	self->channel = 0;
+}}
+
+/*
+ * Every other Mach message the process sends, except to the kernel. The trap's
+ * registers hold the header: x1 options (0x1 send, 0x100000000 vector,
+ * 0x200000000 kernel call), x2 bits | size << 32, x3 remote | local port << 32,
+ * x4 voucher | msgh_id << 32. CoreIPC uses msgh_id 0xdba0dba and 0xdba1dba.
+ * One line with wall time, thread, port, msgh_id, size, the right the message is
+ * sent to (18 for a send-once right) and the channel's label, or - for none.
+ */
+mach_trap::mach_msg2_trap:entry
+/pid == $target/
+{{
+	this->id = (uint64_t)arg4 >> 32;
+	this->send = (arg1 & 0x1) && !(arg1 & 0x200000000) && this->id != 0xdba0dba && this->id != 0xdba1dba;
+	this->size = (uint64_t)arg2 >> 32;
+	this->label = "-";
+}}
+
+/* A vector send has the count of vectors where the size was. The first vector,
+   24 bytes, is the message, with its size 16 bytes in. */
+mach_trap::mach_msg2_trap:entry
+/pid == $target && this->send && (arg1 & 0x100000000)/
+{{
+	this->size = *(uint32_t *)copyin(arg0 + 16, 4);
+}}
+
+/* A send inside _dispatch_mach_msg_send, so the channel is alive. Its label is read
+   once, and the channel is forgotten first, so no later trap can read it. */
+mach_trap::mach_msg2_trap:entry
+/pid == $target && this->send && self->channel/
+{{
+	this->channel = self->channel;
+	self->channel = 0;
+	this->pointer = *(uint64_t *)copyin(this->channel + {dispatch_label:#x}, 8);
+	this->label = this->pointer ? copyinstr(this->pointer) : "-";
+}}
+
+mach_trap::mach_msg2_trap:entry
+/pid == $target && this->send/
+{{
+	printf("mach %d %d %d %d %d %d %s\\n", walltimestamp, tid, arg3 & 0xffffffff, this->id, this->size,
+	    arg2 & 0x1f, this->label);
+}}
+"""
+
+# One clause per message without --bytes.
+LINE = """
+/* Every message the process {verb}. arg1 points to the UniqueRef<{kind}>. */
+{probe}
+{{{{
+	this->object = *(uint64_t *)copyin(arg1, 8);
+	printf("{word} %d %d %d %d %d\\n", walltimestamp, tid,
+	    *(uint16_t *)copyin(this->object + {{{name}:#x}}, 2),
+	    *(uint64_t *)copyin(this->object + {{{dest}:#x}}, 8),
+	    *(uint64_t *)copyin(this->object + {{{size}:#x}}, 8));
+}}}}"""
+
+# With --bytes, the first clause checks that the buffer starts with the message's number, at
+# offset 2, reading only those 2 bytes, so a wrong buffer from setup is never read further. A read
+# that fails leaves this->match 0. The second prints the line and copies the message's first bytes,
+# at most $1, into DTrace's memory to dump them, all in one record so nothing comes between the
+# line and its dump. The third prints the line alone when the check failed.
+LINE_AND_BYTES = """
+/* Every message the process {verb}, with its first bytes. arg1 points to the UniqueRef<{kind}>. */
+{probe}
+{{{{
+	this->match = 0;
+	this->object = *(uint64_t *)copyin(arg1, 8);
+	this->size = *(uint64_t *)copyin(this->object + {{{size}:#x}}, 8);
+	{buffer}
+	this->match = this->size >= 4 && *(uint16_t *)copyin(this->buffer + 2, 2) ==
+	    *(uint16_t *)copyin(this->object + {{{name}:#x}}, 2);
+}}}}
+
+{probe}
+/this->match/
+{{{{
+	printf("{word} %d %d %d %d %d\\n", walltimestamp, tid,
+	    *(uint16_t *)copyin(this->object + {{{name}:#x}}, 2),
+	    *(uint64_t *)copyin(this->object + {{{dest}:#x}}, 8), this->size);
+	this->copy = (char *)alloca($1);
+	copyinto(this->buffer, this->size < $1 ? this->size : $1, this->copy);
+	tracemem(this->copy, $1);
+}}}}
+
+{probe}
+/!this->match/
+{{{{
+	printf("{word} %d %d %d %d %d\\n", walltimestamp, tid,
+	    *(uint16_t *)copyin(this->object + {{{name}:#x}}, 2),
+	    *(uint64_t *)copyin(this->object + {{{dest}:#x}}, 8),
+	    *(uint64_t *)copyin(this->object + {{{size}:#x}}, 8));
+}}}}"""
+
+SEND = dict(verb="sends", kind="Encoder", word="send", name="enc_name", dest="enc_dest", size="enc_size",
+            probe="pid$target:WebKit:IPC??Connection??sendMessageImpl?WTF??*:entry",
+            buffer="this->buffer = *(uint64_t *)copyin(this->object + {enc_buffer:#x}, 8);\n"
+                   "\tthis->buffer = this->buffer ? this->buffer : this->object + {enc_inline:#x};")
+RECEIVE = dict(verb="receives over Mach, before it's dispatched", kind="Decoder", word="receive",
+               name="dec_name", dest="dec_dest", size="dec_size",
+               probe="pid$target:WebKit:IPC??Connection??processIncomingMessage?WTF??*:entry",
+               buffer="this->buffer = *(uint64_t *)copyin(this->object + {dec_buffer:#x}, 8);")
+
+STREAM_CLAUSE = """
+/* Stream messages, which arrive through shared memory, not Mach. arg2 is the Decoder. */
+{entries}
+{{
+	self->decoder = arg2;
+	self->time = walltimestamp;
+	printf("stream %d %d %d %d\\n", self->time, tid,
+	    *(uint16_t *)copyin(arg2 + {dec_name:#x}, 2),
+	    *(uint64_t *)copyin(arg2 + {dec_dest:#x}, 8));
+}}
+
+/* Once the receiver has decoded a stream message, the Decoder's read position is at its end.
+   The Decoder's buffer starts where the message starts, so the difference is its size. Every
+   return follows its own entry, so self->decoder stays set rather than being freed for each
+   message, which at thousands of messages a second makes DTrace drop thread-local variables. */
+{returns}
+/self->decoder/
+{{
+	printf("size %d %d %d\\n", self->time, tid,
+	    *(uint64_t *)copyin(self->decoder + {dec_position:#x}, 8) -
+	    *(uint64_t *)copyin(self->decoder + {dec_buffer:#x}, 8));
+}}
+"""
+
+
+def setup():
+    started = time.time()
+    uuid, libdispatch = uuids()
+    code, _ = disassemble(WEBKIT, webkit_function)
+    for key, prefix in FUNCTIONS.items():
+        if key not in code:
+            sys.exit(f"setup: found no function starting {prefix}")
+    receivers = sorted(key for key in code if key not in FUNCTIONS)
+    dispatch, addresses = disassemble(LIBDISPATCH, lambda symbol: symbol if symbol in (
+        "_dispatch_queue_get_label", "__dispatch_mach_msg_send") else None)
+    for symbol in ("_dispatch_queue_get_label", "__dispatch_mach_msg_send"):
+        if symbol not in dispatch:
+            sys.exit(f"setup: found no {symbol} in libdispatch")
+    dispatch_label = label_offset(dispatch["_dispatch_queue_get_label"])
+    enc_name, enc_dest = encoder_offsets(code["encoder"])
+    enc_size = encoder_size_offset(code["send_outgoing"])
+    enc_buffer, enc_inline = encoder_buffer_offsets(code["send_outgoing"])
+    dec_buffer, dec_size, dec_position, dec_name, dec_dest = decoder_offsets(code["decoder"])
+    recv_name, replies = reply_check(code["receive"])
+    table, last = message_table(code["receive"])
+    found = {"Encoder name": enc_name, "Encoder destination": enc_dest, "Encoder size": enc_size,
+             "Encoder buffer": enc_buffer,
+             "Decoder name": dec_name, "Decoder destination": dec_dest, "Decoder size": dec_size,
+             "Decoder read position": dec_position,
+             "reply IDs in processIncomingMessage": replies, "message table": table,
+             "last message ID": last, "dispatch queue label": dispatch_label}
+    missing = [what for what, value in found.items() if value is None]
+    if missing:
+        sys.exit("setup: couldn't find the " + ", ".join(missing))
+    if not receivers:
+        sys.exit("setup: found no stream receivers")
+    names = read_names(table)
+    ids = {name: i for i, (name, _, _) in enumerate(names)}
+    checks = {
+        "the Encoder constructor and sendOutgoingMessage read the name at the same offset":
+            enc_name == name_offset(code["send_outgoing"]),
+        "the Encoder's 512-byte inline buffer ends where its size field starts": enc_inline + 0x200 == enc_size,
+        "Decoder::create and processIncomingMessage read the name at the same offset": dec_name == recv_name,
+        "Decoder::create and decode<MessageName> keep the read position at the same offset":
+            dec_position in position_stores(code["decode_name"]),
+        "the reply IDs processIncomingMessage tests are SyncMessageReply and CancelSyncMessageReply":
+            replies == {ids.get("SyncMessageReply"), ids.get("CancelSyncMessageReply")},
+        "the table ends right after the last ID processIncomingMessage looks up": len(names) - 1 == last + 1,
+        "WebPage, WebPageProxy, NetworkConnectionToWebProcess and GPUConnectionToWebProcess messages go to their own process":
+            own_process(names),
+        **channel_checks(dispatch_label),
+        "_dispatch_mach_msg_send, which sends a channel's messages, leaves only through ret":
+            only_returns(dispatch["__dispatch_mach_msg_send"], addresses["__dispatch_mach_msg_send"]),
+    }
+
+    print(f"WebKit {uuid}, libdispatch {libdispatch}")
+    print(f"Encoder  name +{enc_name:#x}  destination +{enc_dest:#x}  size +{enc_size:#x}  "
+          f"buffer +{enc_buffer:#x} or inline +{enc_inline:#x}")
+    print(f"Decoder  name +{dec_name:#x}  destination +{dec_dest:#x}  size +{dec_size:#x}  position +{dec_position:#x}")
+    print(f"Dispatch channel  label +{dispatch_label:#x}")
+    print(f"{len(names) - 1} message names, {len(receivers)} stream receivers")
+    for check, ok in checks.items():
+        print(f"{'ok  ' if ok else 'FAIL'}  {check}")
+    if not all(checks.values()):
+        sys.exit("setup: a check failed, so these offsets can't be trusted")
+
+    build = os.path.join(BUILDS, uuid)
+    os.makedirs(build, exist_ok=True)
+    offsets = dict(enc_name=enc_name, enc_dest=enc_dest, enc_size=enc_size, enc_buffer=enc_buffer,
+                   enc_inline=enc_inline, dec_name=dec_name, dec_dest=dec_dest, dec_size=dec_size,
+                   dec_buffer=dec_buffer, dec_position=dec_position, dispatch_label=dispatch_label)
+    probes = [f"pid$target:WebKit:WebKit??{r}??didReceiveStreamMessage?IPC??*" for r in receivers]
+    entries = ",\n".join(p + ":entry" for p in probes)
+    returns = ",\n".join(p + ":return" for p in probes)
+    for name, gpu, copy in (("ipctap", False, False), ("ipctap-gpu", True, False),
+                            ("ipctap-bytes", False, True), ("ipctap-gpu-bytes", True, True)):
+        text = (D_SCRIPT + STREAM_CLAUSE) if gpu else D_SCRIPT
+        # The GPU process's stream messages, thousands a second, overflowed 256k buffers in 3 of 4
+        # traces on an M6, and in none of 2 with 1m.
+        bufsize = "1m" if gpu else "256k"
+        with open(os.path.join(build, name + ".d"), "w") as f:
+            f.write(text.format(uuid=uuid, file=name + ".d", bufsize=bufsize, args=" <bytes>" if copy else "",
+                                send=(LINE_AND_BYTES if copy else LINE).format(**SEND).format(**offsets),
+                                receive=(LINE_AND_BYTES if copy else LINE).format(**RECEIVE).format(**offsets),
+                                entries=entries, returns=returns, **offsets))
+    with open(os.path.join(build, "names.tsv"), "w") as f:
+        for i, (name, sender, receiver) in enumerate(names):
+            f.write(f"{i}\t{name}\t{sender}\t{receiver}\n")
+    # Written last, so a setup that stopped partway runs again. It names the libdispatch the scripts
+    # read, which can change while WebKit stays the same.
+    with open(os.path.join(build, "setup.json"), "w") as f:
+        json.dump({"libdispatch": libdispatch}, f)
+    print(f"wrote {os.path.relpath(build)} in {time.time() - started:.1f} s")
+
+
+def run_setup():
+    """setup, saying where to report it when it fails."""
+    try:
+        setup()
+    except SystemExit as stop:
+        if isinstance(stop.code, str):
+            sys.exit(f"{stop.code}\nipctap is tested on macOS 27.0.1 so far. If this Mac's WebKit is new to it, "
+                     f"please open an issue with this output at {ISSUES}")
+        raise
+
+
+def sip_on():
+    """Whether System Integrity Protection may still restrict DTrace, from csrutil status."""
+    status = subprocess.run(["csrutil", "status"], capture_output=True, text=True).stdout
+    return "status: disabled" not in status and "DTrace Restrictions: disabled" not in status
+
+
+def give_to_user(path):
+    """Under sudo, give a file, or a folder and everything in it, to the user who ran sudo."""
+    if "SUDO_UID" not in os.environ:
+        return
+    uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+    os.chown(path, uid, gid)
+    for folder, dirs, files in os.walk(path):
+        for name in dirs + files:
+            os.chown(os.path.join(folder, name), uid, gid)
+
+
+# Trace
+
+
+def all_processes():
+    """Every process's name, as {pid: name}."""
+    out = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True).stdout
+    return {int(pid): path.rsplit("/", 1)[-1] for pid, path in (line.split(None, 1) for line in out.splitlines())}
+
+
+def app_processes(app, processes):
+    """The app's own process, by executable name or pid, and the WebKit services macOS
+    counts as the app's, as {pid: role}. For an app started from a shell, macOS can
+    count the process that started it as responsible for the app and its services."""
+    responsible = ctypes.CDLL(None).responsibility_get_pid_responsible_for_pid
+    apps, services = set(), {}
+    for pid, name in processes.items():
+        if app in (name, str(pid)):
+            apps.add(pid)
+        elif name.startswith("com.apple.WebKit.WebContent"):
+            services[pid] = "WebContent"
+        elif name in ("com.apple.WebKit.GPU", "com.apple.WebKit.Networking"):
+            services[pid] = name.rsplit(".", 1)[-1]
+    owners = apps | {responsible(pid) for pid in apps}
+    found = {pid: "UI" for pid in apps}
+    found.update({pid: role for pid, role in services.items() if responsible(pid) in owners})
+    return found
+
+
+def port_receivers(pids):
+    """From one lsmp snapshot of every process, the process that receives each port of
+    pids, as {(pid, port name): receiving pid}. A send right's receiver is the process
+    whose receive right has the same ipc-object."""
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "lsmp.json")
+        subprocess.run(["lsmp", "-a", "-j", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(path) as f:
+            processes = json.load(f)["processes"]
+    receivers = {port["ipc-object"]: process["pid"] for process in processes for port in process.get("ports", [])
+                 if "recv" in port.get("rights", [])}
+    return {(process["pid"], int(port["name"], 16)): receivers[port["ipc-object"]]
+            for process in processes if process["pid"] in pids for port in process.get("ports", [])
+            if port.get("ipc-object") in receivers and port.get("name", "").startswith("0x")}
+
+
+def parse(line, pid, role, names):
+    """A dtrace line as a message record, or None for anything else. A Mach message's
+    other end is filled in later, from lsmp."""
+    parts = line.split()
+    if parts and parts[0] == "mach":
+        when, thread, port, ident, size, right = map(int, parts[1:7])
+        label = " ".join(parts[7:])
+        return {"time": when, "pid": pid, "process": role, "thread": thread, "direction": "mach", "peer": "?",
+                "peer_pid": None, "service": None if label == "-" else label, "id": ident, "port": port,
+                "size": size, "send_once": right == 18}
+    if not parts or parts[0] not in ("send", "receive", "stream"):
+        return None
+    direction, when, thread, ident, dest = parts[0], *map(int, parts[1:5])
+    name, sender, receiver = names[ident] if ident < len(names) else (f"#{ident}", "?", "?")
+    return {"time": when, "pid": pid, "process": role, "thread": thread, "direction": direction,
+            "peer": receiver if direction == "send" else sender, "peer_pid": None, "message": name, "id": ident,
+            "destination": dest, "size": int(parts[5]) if direction != "stream" else None}
+
+
+def clock(ns):
+    seconds, ns = divmod(ns, 10**9)
+    return time.strftime("%H:%M:%S", time.localtime(seconds)) + f".{ns // 1000:06d}"
+
+
+def hexdump(data, size):
+    """Rows of 16 bytes in two groups of 8, with the text between bars, like hexdump -C.
+    A row the same as the one before shows as one *, and a cut copy ends with how much
+    of the message it holds."""
+    rows, previous, repeating = [], None, False
+    for i in range(0, len(data), 16):
+        row = data[i:i + 16]
+        if row == previous and i + 16 < len(data):
+            if not repeating:
+                rows.append(f"{'':17}*")
+            repeating = True
+            continue
+        previous, repeating = row, False
+        hex_part = "  ".join(" ".join(f"{b:02x}" for b in half) for half in (row[:8], row[8:]) if half)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        rows.append(f"{'':17}{i:04x}  {hex_part:<48}  |{text}|")
+    if size > len(data):
+        rows.append(f"{'':23}{len(data)} of {size} bytes")
+    return "\n".join(rows)
+
+
+def matches(m, processes, patterns):
+    """Whether a message passes -p, which names roles or pids, and -m, which gives message or
+    service names with wildcards. Repeating an option allows more."""
+    if processes and m["process"].lower() not in processes and str(m["pid"]) not in processes:
+        return False
+    name = (m.get("message") or m.get("service") or "").lower()
+    return not patterns or any(fnmatch.fnmatchcase(name, pattern.lower()) for pattern in patterns)
+
+
+def show(m):
+    process = f"{m['process']} {m['pid']}"
+    arrow = "<-" if m["direction"] in ("receive", "stream") else "->"
+    peer = f"{m['peer']} {m['peer_pid']}" if m["peer_pid"] else m["peer"]
+    if m["direction"] == "mach":
+        # An XPC service often runs as a process of the same name, already shown as the other end.
+        service = m["service"] if m["service"] and m["service"] != m["peer"] else None
+        message = f"{service} {m['id']:#x}" if service else f"{m['id']:#x}" if m["service"] else f"msgh_id {m['id']:#x}"
+        return f"{clock(m['time'])}  {process:<17} {arrow} {peer:<17} {message}  port {m['port']:#x}  {m['size']} bytes"
+    size = "" if m["size"] is None else f"{m['size']} bytes"
+    if m["direction"] == "stream":
+        size = f"{size} (stream)".lstrip()
+    text = f"{clock(m['time'])}  {process:<17} {arrow} {peer:<17} {m['message']}  dest {m['destination']}  {size}"
+    if m.get("bytes"):
+        text += "\n" + hexdump(bytes.fromhex(m["bytes"]), m["size"]) + "\n"
+    return text
+
+
+def show_file(path, processes, patterns):
+    """Print a trace that trace saved as ndjson, with the same filters. A last line
+    cut short, as when trace was killed, is left out."""
+    try:
+        f = sys.stdin if path == "-" else open(path)
+    except OSError as error:
+        sys.exit(f"ipctap: can't read {path}: {error.strerror}")
+    name = "standard input" if path == "-" else path
+    cut = None
+    try:
+        with f:
+            for number, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                if cut:
+                    break
+                try:
+                    m = json.loads(line)
+                except ValueError:
+                    cut = number
+                    continue
+                try:
+                    if matches(m, processes, patterns):
+                        print(show(m))
+                except (KeyError, TypeError, AttributeError):
+                    sys.exit(f"ipctap: line {number} of {name} isn't a message from ipctap trace")
+            else:
+                if cut:
+                    print(f"ipctap: left out line {cut}, which was cut short", file=sys.stderr)
+                return
+    except BrokenPipeError:
+        sys.stdout = open(os.devnull, "w")
+        return
+    sys.exit(f"ipctap: line {cut} of {name} isn't a message from ipctap trace")
+
+
+def trace(app, output, seconds, nbytes, processes, patterns):
+    if os.geteuid() != 0:
+        sys.exit("trace needs root for DTrace. Run sudo ./ipctap trace")
+    if nbytes is not None and not 1 <= nbytes <= 4096:
+        sys.exit("--bytes takes a number from 1 to 4096")
+
+    def note(text):
+        print(f"ipctap: {text}", file=sys.stderr, flush=True)
+
+    uuid, libdispatch = uuids()
+    build = os.path.join(BUILDS, uuid)
+
+    def setup_done():
+        try:
+            with open(os.path.join(build, "setup.json")) as f:
+                return json.load(f).get("libdispatch") == libdispatch
+        except FileNotFoundError:
+            return False
+
+    if not setup_done():
+        note("this Mac's WebKit has no setup yet, so running it first")
+        with contextlib.redirect_stdout(sys.stderr):
+            run_setup()
+        give_to_user(BUILDS)
+    with open(os.path.join(build, "names.tsv")) as f:
+        names = [tuple(line.rstrip("\n").split("\t")[1:]) for line in f]
+    output = output or time.strftime("ipctap-%Y%m%d-%H%M%S.ndjson")
+    out = open(output, "w")
+    give_to_user(output)
+
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    lines = queue.Queue()
+    tracers = {}  # pid -> dtrace process, while it runs
+    roles = {}  # pid -> role, for every process traced
+    problems, reported = [], set()  # the first DTrace error of each kind, and the kinds, with numbers taken out
+
+    def read(pid, role, stream):
+        for line in stream:
+            lines.put((pid, role, line))
+        lines.put((pid, role, None))
+
+    # DTrace's errors come on their own pipe, so that none lands in the middle of a message's line.
+    # Each kind shows once, rather than once for every process.
+    def errors(pid, role, stream):
+        for line in stream:
+            text = line.strip()
+            kind = re.sub(r"0x[0-9a-f]+|\d+", "", text)
+            if text and kind not in reported:
+                reported.add(kind)
+                problems.append(text)
+                note(f"{role} {pid}: {text}")
+
+    def attach(pid, role):
+        script = os.path.join(build, ("ipctap-gpu" if role == "GPU" else "ipctap") + ("-bytes.d" if nbytes else ".d"))
+        dtrace = subprocess.Popen(["/usr/sbin/dtrace", "-q", "-s", script, "-p", str(pid)] + ([str(nbytes)] if nbytes else []),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1,
+                                  encoding="utf-8", errors="backslashreplace")  # DTrace can print bytes that aren't UTF-8
+        tracers[pid] = dtrace
+        roles[pid] = role
+        threading.Thread(target=read, args=(pid, role, dtrace.stdout), daemon=True).start()
+        threading.Thread(target=errors, args=(pid, role, dtrace.stderr), daemon=True).start()
+
+    # Messages from different processes, and from different CPUs in one process, arrive out of
+    # order. Each waits briefly in pending, a heap by time, so they print in time order.
+    pending, order = [], itertools.count()
+    count, total, mach, traced = 0, 0, 0, set()  # for the closing note
+    # A Mach message's other end comes from lsmp snapshots of every process's ports. A snapshot
+    # takes about 0.7 s, so a thread takes them, at most one a second.
+    ports = {}  # (pid, port name) -> the pid that receives it, from the last snapshot
+    snapshot = asked = 0  # when the last snapshot started, and when one was last asked for
+    missing = set()  # (pid, port name) pairs that a snapshot started after their message didn't have
+    names_now = {}  # pid -> process name, from the last ps
+    snapshots = queue.Queue()  # the pids for each snapshot asked for
+
+    def take_snapshots():
+        nonlocal ports, snapshot
+        while True:
+            pids = snapshots.get()
+            started = time.time_ns()
+            ports = port_receivers(pids)
+            snapshot = started
+            time.sleep(max(0.0, 1 - (time.time_ns() - started) / 1e9))
+
+    threading.Thread(target=take_snapshots, daemon=True).start()
+
+    def waits_for_snapshot(m):
+        """Whether a Mach message should wait for a newer snapshot: its port is unknown,
+        no snapshot started after it, and it's under HOLD old. Not for a send-once
+        right, which a snapshot has only while it's held, or an XPC message, whose
+        channel label names the service or whose connection is often gone by then."""
+        if m["direction"] != "mach" or m["send_once"] or m["id"] in XPC_IDS or (m["pid"], m["port"]) in ports:
+            return False
+        if snapshot > m["time"]:
+            missing.add((m["pid"], m["port"]))
+        return (m["pid"], m["port"]) not in missing and time.time_ns() - m["time"] < HOLD
+
+    # Recent sends and receives by direction, message and destination, to find the other end.
+    recent = collections.defaultdict(collections.deque)
+    # Stream messages waiting to print, by pid, thread and time, for their size.
+    streams = {}
+    # With --bytes, the message whose dump is being read, and the bytes so far, by pid.
+    dumps = {}
+    next_prune = 0
+
+    def peer_pid(m):
+        """The process at the other end of a send or receive, when exactly one other
+        traced process received or sent the same message for the same destination
+        within PAIRING of it."""
+        if m["direction"] == "send":
+            other, start, end = "receive", m["time"], m["time"] + PAIRING
+        else:
+            other, start, end = "send", m["time"] - PAIRING, m["time"]
+        pids = {pid for when, pid in recent.get((other, m["id"], m["destination"]), ())
+                if start <= when <= end and pid != m["pid"]}
+        return pids.pop() if len(pids) == 1 else None
+
+    def flush(older_than, final=False):
+        nonlocal count, total, mach, recent, next_prune, asked
+        shown = []
+        while pending and pending[0][0] < older_than:
+            m = pending[0][2]
+            if not final and waits_for_snapshot(m):
+                if asked <= snapshot:
+                    asked = time.time_ns()
+                    snapshots.put(set(roles))
+                break
+            heapq.heappop(pending)
+            if m["direction"] == "mach":
+                del m["send_once"]
+                m["peer_pid"] = ports.get((m["pid"], m["port"]))
+                if m["peer_pid"] == m["pid"]:
+                    continue
+                m["peer"] = roles.get(m["peer_pid"]) or names_now.get(m["peer_pid"], "?")
+            elif m["direction"] == "stream":
+                streams.pop((m["pid"], m["thread"], m["time"]), None)
+            else:
+                m["peer_pid"] = peer_pid(m)
+                if m["peer_pid"]:
+                    m["peer"] = roles[m["peer_pid"]]
+            total += 1
+            if not matches(m, processes, patterns):
+                continue
+            out.write(json.dumps(m) + "\n")
+            count += 1
+            mach += m["direction"] == "mach"
+            traced.add(m["pid"])
+            shown.append(show(m))
+        try:
+            if shown:
+                print("\n".join(shown), flush=True)
+        except BrokenPipeError:
+            sys.stdout = open(os.devnull, "w")
+            stop.set()
+        if time.time() >= next_prune:
+            # Messages held for a snapshot still need the sends and receives around them.
+            cutoff = min(older_than, pending[0][0] if pending else older_than) - 2 * PAIRING
+            for times in recent.values():
+                while times and times[0][0] < cutoff:
+                    times.popleft()
+            recent = collections.defaultdict(collections.deque, {key: times for key, times in recent.items() if times})
+            next_prune = time.time() + 1
+
+    # Every CoreIPC message starts with its flags, its number at offset 2 and its destination at
+    # offset 8. The D scripts copy a message's bytes only when its buffer starts with its number, so
+    # a message without bytes, or with bytes for another header, means setup found the wrong buffer.
+    mismatches = 0
+
+    def mismatch(m):
+        nonlocal mismatches
+        mismatches += 1
+        if mismatches == 1:
+            note(f"{m['message']} came without bytes that start with its number and destination, "
+                 "so the buffer setup found may be wrong. Don't trust --bytes on this build.")
+
+    def check_header(m, data):
+        head = bytes(data[:min(len(data), m["size"], 16)])
+        number, dest = m["id"].to_bytes(2, "little"), m["destination"].to_bytes(8, "little")
+        if head[2:4] != number[:len(head[2:4])] or head[8:16] != dest[:len(head[8:16])]:
+            mismatch(m)
+
+    def handle(item):
+        nonlocal first_ready
+        pid, role, line = item
+        if line is None:
+            tracers.pop(pid, None)
+            return
+        if pid in dumps:
+            # A dump is a blank line, a header and rows like "  10: 03 0c 00 ...  ascii".
+            row = re.match(r"\s+[0-9a-f]+: ((?:[0-9a-f]{2} )+)", line)
+            if row:
+                m, data = dumps[pid]
+                data += bytes.fromhex(row[1])
+                if len(data) >= nbytes:
+                    m["bytes"] = data[:min(m["size"], nbytes)].hex()
+                    del dumps[pid]
+                    check_header(m, data)
+                return
+            if not line.strip() or "0123456789abcdef" in line:
+                return
+            mismatch(dumps.pop(pid)[0])
+        m = parse(line, pid, role, names)
+        if m:
+            heapq.heappush(pending, (m["time"], next(order), m))
+            if m["direction"] == "stream":
+                streams[(pid, m["thread"], m["time"])] = m
+            elif m["direction"] != "mach":
+                recent[(m["direction"], m["id"], m["destination"])].append((m["time"], pid))
+            if nbytes:
+                m["bytes"] = None
+                if m["direction"] in ("send", "receive"):
+                    dumps[pid] = (m, bytearray())
+        elif line.startswith("size "):
+            when, thread, size = map(int, line.split()[1:])
+            m = streams.get((pid, thread, when))
+            if m and m["size"] is None and 0 < size < 1 << 31:
+                m["size"] = size
+        elif line.startswith("ready "):
+            first_ready = first_ready or time.time()
+            note(f"tracing {role} {pid} from {clock(int(line.split()[1]))}")
+        elif line.strip():
+            note(f"{role} {pid}: {line.strip()}")
+
+    def receive(timeout):
+        try:
+            handle(lines.get(timeout=timeout))
+            for _ in range(20000):
+                handle(lines.get_nowait())
+        except queue.Empty:
+            pass
+
+    note(f"{app} with WebKit {uuid}, writing {output}. Ctrl-C stops.")
+    # -t counts from when the first process is traced, so it's that long of tracing. While no
+    # process is being attached, it counts from the start, so a trace of an app that never runs ends.
+    started, first_attach, first_ready, next_scan, waiting, slow = time.time(), None, None, 0, False, False
+    try:
+        while not stop.is_set():
+            now = time.time()
+            since = first_ready or (None if roles else started)
+            if seconds and since and now >= since + seconds:
+                break
+            if now >= next_scan:
+                names_now = all_processes()
+                found = app_processes(app, names_now)
+                if not found and not roles and not waiting:
+                    note(f"{app} isn't running. Waiting for it.")
+                    waiting = True
+                for pid, role in found.items():
+                    if pid not in roles:
+                        attach(pid, role)
+                        first_attach = first_attach or now
+                next_scan = time.time() + 0.5
+            receive(0.1)
+            flush(time.time_ns() - 500_000_000)
+            if roles and not first_ready:
+                if not tracers or now - first_attach > 120:
+                    break  # every DTrace stopped, or none got ready in 2 minutes
+                if now - first_attach > 5 and not slow:
+                    note("DTrace is still getting ready, which can take a minute the first time on a Mac.")
+                    slow = True
+    finally:
+        # Even if ipctap fails, every DTrace stops and lets go of its process.
+        for dtrace in tracers.values():
+            if dtrace.poll() is None:
+                dtrace.send_signal(signal.SIGINT)
+    give_up = time.time() + 5
+    while tracers and time.time() < give_up:
+        receive(0.1)
+    for dtrace in tracers.values():
+        dtrace.kill()
+    flush(float("inf"), final=True)
+    out.close()
+    if mismatches:
+        note(f"{mismatches} messages came without bytes that match their header")
+    if not first_ready:
+        if not roles:
+            sys.exit(f"ipctap: traced nothing, because {app} never ran.")
+        if not problems:
+            sys.exit(f"ipctap: traced nothing, because DTrace wasn't ready after {time.time() - first_attach:.0f} s. "
+                     "The first trace on a Mac can take a minute.")
+        hint = ("ipctap needs root and System Integrity Protection off, and SIP is on. "
+                "See Requirements in the README." if sip_on() else
+                f"If this keeps happening, please open an issue with this output at {ISSUES}")
+        sys.exit(f"ipctap: traced nothing. DTrace said: {problems[0]}\nipctap: {hint}")
+    def many(n, word):
+        return f"{n} {word}" if n == 1 else f"{n} {word}es" if word.endswith("s") else f"{n} {word}s"
+
+    counted = f"{count} of {many(total, 'message')} matched -p and -m," if processes or patterns else many(count, "message")
+    note(f"{counted} from {many(len(traced), 'process')}, {mach} of them other Mach messages, written to {output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"ipctap {VERSION}")
+    commands = parser.add_subparsers(dest="command", required=True)
+    filters = argparse.ArgumentParser(add_help=False)
+    filters.add_argument("-p", metavar="PROCESS", action="append", default=[], dest="processes",
+                         help="only this process: UI, WebContent, GPU, Networking or a pid (repeatable)")
+    filters.add_argument("-m", metavar="MESSAGE", action="append", default=[], dest="patterns",
+                         help="only messages or services with this name, * and ? allowed (repeatable)")
+    tracing = commands.add_parser("trace", parents=[filters])
+    tracing.add_argument("-a", metavar="APP", default="Safari",
+                         help="the app, by the name of its executable or its pid (default Safari)")
+    tracing.add_argument("-o", metavar="FILE", help="ndjson output (default ipctap-<date>-<time>.ndjson)")
+    tracing.add_argument("-t", metavar="SECONDS", type=float, help="stop after this many seconds")
+    tracing.add_argument("--bytes", metavar="N", nargs="?", type=int, const=256,
+                         help="also copy each CoreIPC message's first N bytes (default 256) and print them")
+    showing = commands.add_parser("show", parents=[filters])
+    showing.add_argument("file", help="an ndjson file from trace, or - for standard input")
+    commands.add_parser("setup")
+    args = parser.parse_args()
+    roles = {"ui", "webcontent", "gpu", "networking"}
+    processes = {value.lower() for value in getattr(args, "processes", [])}
+    if any(value not in roles and not value.isdigit() for value in processes):
+        parser.error("-p takes UI, WebContent, GPU, Networking or a pid")
+    if args.command == "setup":
+        run_setup()
+    elif args.command == "show":
+        show_file(args.file, processes, args.patterns)
+    else:
+        trace(args.a, args.o, args.t, args.bytes, processes, args.patterns)
+
+
+if __name__ == "__main__":
+    main()
